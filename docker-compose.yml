@@ -1,0 +1,128 @@
+name: libra
+
+x-app: &app
+  build: .
+  image: libra-app:latest
+  environment: &app-env
+    DATABASE_URL: postgresql+psycopg://libra:libra@db:5432/libra
+    REDIS_URL: redis://redis:6379/0
+    CACHE_URL: redis://cache:6379/0
+    CACHE_ENABLED: ${CACHE_ENABLED:-true}
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+  networks: [backend]
+  restart: unless-stopped
+  stop_grace_period: 15s
+  cpus: 1.0
+  mem_limit: 512m
+
+services:
+  lb:
+    image: haproxy:2.8-alpine
+    volumes:
+      - ./lb/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    environment:
+      LB_ALGO: ${LB_ALGO:-roundrobin}
+      APP1_WEIGHT: ${APP1_WEIGHT:-1}
+      APP2_WEIGHT: ${APP2_WEIGHT:-1}
+      APP3_WEIGHT: ${APP3_WEIGHT:-1}
+    ports:
+      - "8080:8080"
+      - "8404:8404"
+    depends_on: [app1, app2, app3]
+    networks: [backend]
+    restart: unless-stopped
+
+  app1:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app-1
+      CHAOS_DELAY_MS: ${APP1_DELAY_MS:-0}
+
+  app2:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app-2
+      CHAOS_DELAY_MS: ${APP2_DELAY_MS:-0}
+
+  app3:
+    <<: *app
+    environment:
+      <<: *app-env
+      INSTANCE_ID: app-3
+      CHAOS_DELAY_MS: ${APP3_DELAY_MS:-0}
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: libra
+      POSTGRES_USER: libra
+      POSTGRES_PASSWORD: libra
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U libra -d libra"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  cache:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no",
+              "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lfu"]
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  k6:
+    image: grafana/k6:1.4.2
+    profiles: ["loadtest"]
+    volumes:
+      - ./load-tests:/load-tests
+    working_dir: /load-tests
+    environment:
+      BASE_URL: http://lb:8080
+    networks: [backend]
+
+  migrate:
+    build: .
+    image: libra-app:latest
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://libra:libra@db:5432/libra
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [backend]
+    restart: "no"
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  backend:
